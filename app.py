@@ -1,49 +1,39 @@
-from flask import Flask, request, jsonify
 import numpy as np
 import tensorflow as tf
-import joblib
-import pandas as pd
-from tensorflow.keras.models import load_model
+import pickle
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-# Load model and scaler
-MODEL_PATH = "air_quality_model_v5.h5"
-SCALER_PATH = "air_scaler.pkl"
+# Load the trained LSTM model
+model = tf.keras.models.load_model("air_quality_model_v5.h5")
 
-model = load_model(MODEL_PATH, custom_objects={"mse": tf.keras.losses.MeanSquaredError()})
-scaler = joblib.load(SCALER_PATH)
+# Load the saved scaler
+with open("air_scaler.pkl", "rb") as f:
+    scaler = pickle.load(f)
 
-# Features and sequence length
-FEATURES = ['CO(ppm)', 'SO2(ppm)', 'NO2(ppm)', 'O3(ppm)', 'PM2.5', 'PM10', 'H2S', 'CO2(ppm)', 'TVOC(ppb)']
-SEQ_LENGTH = 7  # Expecting 7 time steps
+app = FastAPI()
 
-app = Flask(__name__)
+# Define expected input format
+class InputData(BaseModel):
+    sequence: list  # List of 7 days, each with 9 features
 
-def preprocess_input(data):
-    """Scale and reshape input data for LSTM prediction."""
+@app.post("/predict")
+async def predict(data: InputData):
     try:
-        df = pd.DataFrame(data, columns=FEATURES)
-        scaled_data = scaler.transform(df)  # Scale input features
-        scaled_data = np.array(scaled_data).reshape(1, SEQ_LENGTH, len(FEATURES))  # Reshape for LSTM
-        return scaled_data
-    except Exception as e:
-        return str(e)
+        # Convert input into numpy array
+        X_input = np.array(data.sequence).reshape(1, 7, 9)
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    try:
-        data = request.json["data"]  # Should be a list of lists (7 time steps of 9 features)
-        if len(data) != SEQ_LENGTH or len(data[0]) != len(FEATURES):
-            return jsonify({"error": "Invalid input shape. Expected (7, 9)"}), 400
+        # Reshape to 2D and scale (since scaler was fitted on 2D data)
+        X_reshaped = X_input.reshape(-1, 9)  # Convert (7,9) → (7*9,)
+        X_scaled = scaler.transform(X_reshaped).reshape(1, 7, 9)  # Reshape back
 
-        processed_data = preprocess_input(data)
-        if isinstance(processed_data, str):
-            return jsonify({"error": processed_data}), 400  # Return error if preprocessing fails
+        # Make prediction
+        y_pred_scaled = model.predict(X_scaled)
 
-        prediction = model.predict(processed_data)
-        return jsonify({"prediction": prediction.tolist()})  # Convert to JSON format
+        # Inverse transform the predicted values
+        y_pred_original = scaler.inverse_transform(y_pred_scaled)
+
+        return {"prediction": y_pred_original.tolist()}
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500  # Handle errors
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+        return {"error": str(e)}
